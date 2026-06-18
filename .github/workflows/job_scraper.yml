@@ -48,7 +48,7 @@ jobs:
       #       are never written to disk or logged.
       - name: Run pipeline
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python main.py

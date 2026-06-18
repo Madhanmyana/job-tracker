@@ -164,7 +164,7 @@ def fetch_unread_jobs() -> tuple[list[dict], list[bytes]]:
             raw_jobs.append(
                 {
                     "title": subject,
-                    "text": text[:4000],  # cap to avoid huge Gemini prompts
+                    "text": text[:4000],  # cap to avoid huge LLM prompts
                     "apply_url": apply_url,
                     "all_urls": urls,
                 }

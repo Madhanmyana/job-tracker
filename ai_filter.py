@@ -1,49 +1,99 @@
 """
 ai_filter.py
 ============
-Gemini 2.0 Flash scoring and tier-based filtering.
+Groq (llama-3.3-70b-versatile) scoring and tier-based filtering.
+
+Migration note (2026-06-18)
+---------------------------
+Replaced Google Gemini SDK with Groq to bypass free-tier 429 (Resource
+Exhausted) rate limits.  The Groq free tier offers significantly higher
+requests-per-minute on llama-3.3-70b-versatile.
 
 Pipeline
 --------
-1. Assemble a single JSON prompt from all raw job dicts (batched to stay
-   within token limits).
-2. Send to ``gemini-2.0-flash`` with ``response_mime_type="application/json"``
-   so the model returns a structured payload directly.
-3. Parse and validate the response through ``JobEvaluationList`` (Pydantic).
-4. Apply tier filter:
+1. Assemble a plain-text prompt from all raw job dicts (batched to stay
+   within token limits, default batch size = 10).
+2. Send to ``llama-3.3-70b-versatile`` via the Groq Chat Completions API.
+3. Strip any accidental markdown fences from the response.
+4. Parse and validate the returned JSON through ``JobEvaluationList`` (Pydantic).
+5. Apply tier filter:
      - Keep ALL  ``Tier_A_Strong`` jobs.
-     - Keep      ``Tier_B_Fuzzy``  jobs only if ``match_score >= 70``.
+     - Keep      ``Tier_B_Fuzzy``  jobs only if ``match_score >= MIN_TIER_B_SCORE``.
      - Discard   ``Tier_C_None``   jobs unconditionally.
+
+Fallback (keyword-based)
+------------------------
+If the Groq API call fails (rate-limit, network error, bad JSON, etc.) for a
+given batch, a local rule-based keyword classifier is used so the pipeline
+never crashes.  Keyword-matched jobs are assigned conservative scores and
+flagged in their ``logic_summary``.
 
 Error handling
 --------------
-If the AI response is malformed or the Pydantic validation fails, a
-``ValueError`` is raised with a descriptive message.  ``main.py`` catches
-this and aborts the run with a log entry rather than sending a broken email.
+A ``ValueError`` is raised only if *both* the Groq call and the keyword
+fallback fail for the same batch, which in practice should never happen.
+``main.py`` catches ``ValueError`` and aborts with a log entry.
 """
 
 import json
 import logging
+import os
+import re
 import time
-from textwrap import dedent
 
-from google import genai
-from google.genai import types
+from groq import Groq
 
 from config import (
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    GEMINI_SYSTEM_INSTRUCTION,
+    GROQ_API_KEY,
+    GROQ_MODEL,
     MIN_TIER_B_SCORE,
     TIER_A,
     TIER_B,
+    TIER_C,
 )
 from models import JobEvaluation, JobEvaluationList
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of jobs per Gemini request (prevents token overflow)
-_BATCH_SIZE: int = 20
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Jobs per Groq request — keep lower than Gemini batch to stay within
+# Groq free-tier context window and token-per-minute limits.
+_BATCH_SIZE: int = 10
+
+# Seconds to sleep between successive Groq API calls (free-tier courtesy).
+_INTER_BATCH_DELAY: float = 2.0
+
+# ---------------------------------------------------------------------------
+# Keyword sets for the local fallback classifier
+# ---------------------------------------------------------------------------
+
+_TIER_A_KEYWORDS: frozenset[str] = frozenset([
+    "fastapi", "flask", "django", "rest api", "restful", "backend engineer",
+    "backend developer", "python developer", "python backend", "api development",
+    "fresher", "entry level", "entry-level", "0-1 year", "0 to 1 year",
+    "internship", "intern", "graduate trainee", "junior developer",
+    "junior engineer", "jwt", "authentication", "sqlalchemy", "postgresql",
+    "mysql", "fastapi developer",
+])
+
+_TIER_B_KEYWORDS: frozenset[str] = frozenset([
+    "python", "sql", "software engineer", "software developer", "full stack",
+    "fullstack", "cloud", "aws", "azure", "gcp", "devops", "backend",
+    "1-2 year", "1 to 2 year", "associate engineer", "associate developer",
+    "api", "microservices", "docker", "kubernetes", "data engineer",
+    "machine learning", "ml engineer",
+])
+
+_DISCARD_KEYWORDS: frozenset[str] = frozenset([
+    "3+ years", "3 years", "4 years", "5 years", "senior", "lead", "manager",
+    "director", "architect", "principal", "exclusively java", "spring boot",
+    "exclusively node", "frontend only", "react developer", "angular developer",
+    "vue developer", "ui developer", "graphic designer", "product manager",
+    "hr ", "human resources", "sales", "business development",
+])
 
 
 # ---------------------------------------------------------------------------
@@ -52,72 +102,217 @@ _BATCH_SIZE: int = 20
 
 def _build_prompt(batch: list[dict]) -> str:
     """
-    Serialise a batch of raw job dicts into the prompt sent to Gemini.
+    Build a plain-text prompt optimised for Llama 3.3.
 
-    Each job is rendered as a numbered block containing its title and body
-    text so the model has enough context to assign an accurate tier.
+    The model is commanded to return a raw JSON array with **no** markdown
+    code fences and **no** conversational text — just the JSON.
+
+    Each element in the output array must contain exactly these keys:
+      id, title, company, tier, match_score, reason, clean_apply_url
+
+    Tiers:
+      Tier_A_Strong  — strong Python backend / fresher match
+      Tier_B_Fuzzy   — adjacent / partial match or 1-2 yr experience
+      Tier_C_None    — discard (3+ yrs, wrong stack, non-engineering)
     """
-    lines: list[str] = [
-        "Below are job postings extracted from email alerts and web scrapes.",
-        "Evaluate each one and return a JSON object with a top-level 'jobs' array.",
-        "Each element must have exactly these fields:",
-        "  job_title, company, match_tier, match_score, logic_summary, clean_apply_url",
-        "",
-        "match_tier must be one of: Tier_A_Strong | Tier_B_Fuzzy | Tier_C_None",
-        "match_score must be an integer from 1 to 100.",
-        "clean_apply_url must be the application URL with tracking params stripped.",
-        "",
-    ]
+    header = (
+        "You are an expert IT technical recruiter evaluating job postings for an "
+        "entry-level Python Backend Engineer (0-1 year experience). "
+        "The candidate's skills: Python, FastAPI, REST APIs, SQL, JWT, Authentication.\n\n"
+        "TARGET ROLES: Backend Engineer, Python Developer, Python Backend Developer, "
+        "Backend Intern, Software Engineer (Python).\n\n"
+        "CLASSIFICATION RULES:\n"
+        "  Tier_A_Strong : Explicitly requires Python backend (FastAPI/Django/Flask/REST) "
+        "AND targets freshers/interns/0-1 yr candidates.\n"
+        "  Tier_B_Fuzzy  : General software roles with Python/SQL, OR entry-level roles "
+        "where backend is part of the stack, OR roles asking 1-2 yrs where a strong "
+        "fresher can still apply.\n"
+        "  Tier_C_None   : Requires 3+ years, is purely frontend, uses an exclusively "
+        "different stack (Java/Spring Boot only, Node.js only), or is non-engineering.\n\n"
+        "STRICT OUTPUT FORMAT — respond with a raw JSON array ONLY.\n"
+        "Do NOT wrap it in ```json code fences.\n"
+        "Do NOT add any explanation, greeting, or text outside the JSON.\n"
+        "Each element must have exactly these keys:\n"
+        "  id            (integer — same as the job number below)\n"
+        "  title         (string  — job title extracted from the posting)\n"
+        "  company       (string  — company name)\n"
+        "  tier          (string  — one of: Tier_A_Strong | Tier_B_Fuzzy | Tier_C_None)\n"
+        "  match_score   (integer — 1 to 100, alignment strength)\n"
+        "  reason        (string  — one concise sentence explaining the tier/score)\n"
+        "  clean_apply_url (string — application URL with tracking params stripped)\n\n"
+        "JOB POSTINGS:\n"
+    )
 
+    job_blocks: list[str] = []
     for i, job in enumerate(batch, start=1):
-        lines.append(f"--- Job #{i} ---")
-        lines.append(f"Subject / Title : {job.get('title', 'Unknown')}")
-        lines.append(f"Apply URL       : {job.get('clean_url') or job.get('apply_url', '')}")
-        lines.append(f"Body text       :\n{job.get('text', '')[:2000]}")
-        lines.append("")
+        apply_url = job.get("clean_url") or job.get("apply_url", "")
+        text_snippet = job.get("text", "")[:1500]  # trim to keep token count low
+        job_blocks.append(
+            f"--- Job #{i} ---\n"
+            f"Subject/Title : {job.get('title', 'Unknown')}\n"
+            f"Apply URL     : {apply_url}\n"
+            f"Body Text     :\n{text_snippet}\n"
+        )
 
-    return "\n".join(lines)
+    return header + "\n".join(job_blocks)
 
 
-def _call_gemini(client: genai.Client, prompt: str) -> list[JobEvaluation]:
+def _strip_markdown_fences(raw: str) -> str:
     """
-    Send *prompt* to the Gemini model and parse the structured JSON response
-    into a validated list of ``JobEvaluation`` objects.
+    Remove markdown code fences (```json ... ``` or ``` ... ```) that the
+    model may emit despite being instructed not to.
+    """
+    # Remove leading/trailing whitespace first
+    raw = raw.strip()
+    # Pattern: optional language tag after opening fence
+    raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
+
+
+def _call_groq(client: Groq, prompt: str) -> str:
+    """
+    Send *prompt* to the Groq Chat Completions endpoint and return the raw
+    response text.
 
     Raises
     ------
-    ValueError
-        If the response cannot be parsed or fails Pydantic validation.
+    Exception
+        Re-raises any exception from the Groq SDK so the caller can decide
+        whether to fall back to keyword classification.
     """
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=GEMINI_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            temperature=0.2,   # low temperature → more deterministic tier assignments
-        ),
+    logger.debug("Sending request to Groq model '%s'.", GROQ_MODEL)
+    chat_completion = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model=GROQ_MODEL,
+        temperature=0.1,   # near-deterministic tier assignments
     )
+    return chat_completion.choices[0].message.content
 
-    raw_text: str = response.text or ""
-    logger.debug("Raw Gemini response (truncated): %s", raw_text[:500])
+
+def _parse_groq_response(raw_text: str, batch: list[dict]) -> list[JobEvaluation]:
+    """
+    Parse and Pydantic-validate the JSON returned by Groq.
+
+    Returns a list of ``JobEvaluation`` objects on success, or raises
+    ``ValueError`` with a descriptive message on failure.
+    """
+    cleaned = _strip_markdown_fences(raw_text)
+    logger.debug("Groq response (stripped, first 500 chars): %s", cleaned[:500])
 
     try:
-        parsed_data = json.loads(raw_text)
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            f"Gemini returned non-JSON response: {exc}\n"
-            f"Raw output (first 300 chars): {raw_text[:300]}"
+            f"Groq returned non-JSON response: {exc}\n"
+            f"Raw output (first 400 chars): {raw_text[:400]}"
         ) from exc
 
+    # The model may return a bare array or an object wrapping one.
+    if isinstance(parsed, dict):
+        # Try common wrapper keys: "jobs", "results", "data"
+        for key in ("jobs", "results", "data"):
+            if key in parsed and isinstance(parsed[key], list):
+                parsed = parsed[key]
+                break
+        else:
+            raise ValueError(
+                f"Groq returned a JSON object but no recognisable array key found. "
+                f"Keys present: {list(parsed.keys())}"
+            )
+
+    if not isinstance(parsed, list):
+        raise ValueError(
+            f"Expected a JSON array from Groq, got {type(parsed).__name__}."
+        )
+
+    # Normalise field names: the model might use 'reason' instead of
+    # 'logic_summary' and 'tier' instead of 'match_tier'.
+    normalised: list[dict] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        normalised.append({
+            "job_title":       item.get("title", item.get("job_title", "Unknown")),
+            "company":         item.get("company", "Unknown"),
+            "match_tier":      item.get("tier", item.get("match_tier", TIER_C)),
+            "match_score":     item.get("match_score", 50),
+            "logic_summary":   item.get("reason", item.get("logic_summary", "")),
+            "clean_apply_url": item.get("clean_apply_url",
+                                        batch[parsed.index(item)].get("clean_url", "")
+                                        if parsed.index(item) < len(batch) else ""),
+        })
+
     try:
-        evaluation_list = JobEvaluationList.model_validate(parsed_data)
+        evaluation_list = JobEvaluationList.model_validate({"jobs": normalised})
     except Exception as exc:
         raise ValueError(
-            f"Pydantic validation failed for Gemini response: {exc}"
+            f"Pydantic validation failed for Groq response: {exc}"
         ) from exc
 
     return evaluation_list.jobs
+
+
+def _keyword_fallback(batch: list[dict]) -> list[JobEvaluation]:
+    """
+    Local rule-based classifier used when the Groq API call fails.
+
+    Inspects ``title`` and ``text`` fields for known keywords and assigns
+    a conservative tier and score.  Jobs are never silently dropped — they
+    are assigned ``Tier_C_None`` only if discard keywords dominate.
+
+    This ensures the pipeline always produces *some* output even during
+    prolonged API outages.
+    """
+    logger.warning(
+        "Groq API unavailable for this batch — running keyword fallback classifier "
+        "on %d job(s).",
+        len(batch),
+    )
+    results: list[JobEvaluation] = []
+
+    for job in batch:
+        combined = (
+            (job.get("title", "") + " " + job.get("text", "")).lower()
+        )
+        apply_url = job.get("clean_url") or job.get("apply_url", "")
+
+        # Check discard signals first
+        if any(kw in combined for kw in _DISCARD_KEYWORDS):
+            tier = TIER_C
+            score = 20
+            reason = "[Keyword Fallback] Discard keywords detected (3+ yrs / senior / wrong stack)."
+        elif any(kw in combined for kw in _TIER_A_KEYWORDS):
+            tier = TIER_A
+            score = 72   # conservative — we don't have AI confidence here
+            reason = "[Keyword Fallback] Strong Python backend / fresher keywords matched."
+        elif any(kw in combined for kw in _TIER_B_KEYWORDS):
+            tier = TIER_B
+            score = 62   # deliberately below MIN_TIER_B_SCORE=70 unless clearly relevant
+            reason = "[Keyword Fallback] General Python/software keywords matched."
+        else:
+            tier = TIER_C
+            score = 15
+            reason = "[Keyword Fallback] No relevant keywords found."
+
+        try:
+            results.append(
+                JobEvaluation(
+                    job_title=job.get("title", "Unknown"),
+                    company=job.get("source", "Unknown"),
+                    match_tier=tier,       # type: ignore[arg-type]
+                    match_score=score,
+                    logic_summary=reason,
+                    clean_apply_url=apply_url,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Keyword fallback skipped one job due to validation error: %s", exc)
+
+    logger.info(
+        "Keyword fallback produced %d evaluation(s) for batch.", len(results)
+    )
+    return results
 
 
 def _apply_tier_filter(evaluations: list[JobEvaluation]) -> list[JobEvaluation]:
@@ -157,7 +352,7 @@ def _apply_tier_filter(evaluations: list[JobEvaluation]) -> list[JobEvaluation]:
 
 def evaluate_jobs(raw_jobs: list[dict]) -> list[JobEvaluation]:
     """
-    Score and filter *raw_jobs* using Gemini 2.0 Flash.
+    Score and filter *raw_jobs* using Groq (llama-3.3-70b-versatile).
 
     Parameters
     ----------
@@ -172,36 +367,83 @@ def evaluate_jobs(raw_jobs: list[dict]) -> list[JobEvaluation]:
     Raises
     ------
     ValueError
-        If the AI response cannot be parsed or validated.
+        Only if both the Groq API call and the keyword fallback fail for the
+        same batch — practically unreachable.
     """
     if not raw_jobs:
         logger.info("No jobs to evaluate.")
         return []
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    all_kept: list[JobEvaluation] = []
+    if not GROQ_API_KEY:
+        logger.error(
+            "GROQ_API_KEY is not set. Cannot initialise Groq client. "
+            "Falling back to keyword classifier for all jobs."
+        )
+        all_evals = _keyword_fallback(raw_jobs)
+        return _apply_tier_filter(all_evals)
 
-    # Process in batches to avoid token-limit errors
+    client = Groq(api_key=GROQ_API_KEY)
+    all_kept: list[JobEvaluation] = []
+    total_batches = -(-len(raw_jobs) // _BATCH_SIZE)  # ceiling division
+
     for batch_start in range(0, len(raw_jobs), _BATCH_SIZE):
-        batch = raw_jobs[batch_start : batch_start + _BATCH_SIZE]
+        batch = raw_jobs[batch_start: batch_start + _BATCH_SIZE]
         batch_num = (batch_start // _BATCH_SIZE) + 1
-        total_batches = -(-len(raw_jobs) // _BATCH_SIZE)  # ceiling div
 
         logger.info(
-            "Sending batch %d/%d (%d jobs) to Gemini …",
-            batch_num, total_batches, len(batch),
+            "Sending batch %d/%d (%d job(s)) to Groq [%s] …",
+            batch_num, total_batches, len(batch), GROQ_MODEL,
         )
 
-        prompt = _build_prompt(batch)
-        evaluations = _call_gemini(client, prompt)
-        time.sleep(65)  # pause between batches to stay within free-tier RPM limit
+        evaluations: list[JobEvaluation] = []
 
+        try:
+            prompt = _build_prompt(batch)
+            raw_response = _call_groq(client, prompt)
+            evaluations = _parse_groq_response(raw_response, batch)
+            logger.info(
+                "Batch %d/%d: received %d valid evaluation(s) from Groq.",
+                batch_num, total_batches, len(evaluations),
+            )
+
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "Batch %d/%d: JSON parse error (%s). Activating keyword fallback.",
+                batch_num, total_batches, exc,
+            )
+            evaluations = _keyword_fallback(batch)
+
+        except ValueError as exc:
+            logger.warning(
+                "Batch %d/%d: Pydantic / format error (%s). Activating keyword fallback.",
+                batch_num, total_batches, exc,
+            )
+            evaluations = _keyword_fallback(batch)
+
+        except Exception as exc:  # noqa: BLE001
+            # Catches Groq rate-limit (429), network errors, auth errors, etc.
+            logger.warning(
+                "Batch %d/%d: Groq API error (%s: %s). Activating keyword fallback.",
+                batch_num, total_batches, type(exc).__name__, exc,
+            )
+            evaluations = _keyword_fallback(batch)
+
+        # Apply tier filter to this batch's evaluations
         logger.info(
-            "Batch %d/%d: received %d evaluation(s). Applying tier filter …",
+            "Batch %d/%d: applying tier filter to %d evaluation(s) …",
             batch_num, total_batches, len(evaluations),
         )
         kept = _apply_tier_filter(evaluations)
         all_kept.extend(kept)
+
+        # Polite inter-batch delay — respects Groq free-tier rate limits
+        # without the 65-second penalty of the previous Gemini implementation.
+        if batch_start + _BATCH_SIZE < len(raw_jobs):
+            logger.debug(
+                "Sleeping %.1fs before next batch to respect Groq rate limits.",
+                _INTER_BATCH_DELAY,
+            )
+            time.sleep(_INTER_BATCH_DELAY)
 
     logger.info(
         "AI filtering complete: %d/%d job(s) passed the tier threshold.",

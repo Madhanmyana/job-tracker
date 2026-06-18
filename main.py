@@ -10,7 +10,7 @@ Execution order
 3.  Stream B  — Scraping:   fetch jobs from configured targets (isolated try/except)
 4.  Merge both streams and deduplicate against the seen set
 5.  Abort gracefully if there are no new jobs
-6.  AI filter — Gemini 2.0 Flash: score and tier-classify new jobs
+6.  AI filter — Groq (llama-3.3-70b-versatile): score and tier-classify new jobs
 7.  Abort gracefully if no jobs pass the tier threshold
 8.  Build HTML report and send via SMTP (self → self)
 9.  ONLY on SMTP success:
@@ -104,7 +104,7 @@ def main() -> None:
     # ── Step 5 (implicit) — no new jobs was handled above ─────────────────
 
     # ── Step 6: AI tier filtering ─────────────────────────────────────────
-    logger.info("--- AI Evaluation (Gemini 2.0 Flash) ---")
+    logger.info("--- AI Evaluation (Groq — llama-3.3-70b-versatile) ---")
     try:
         filtered_jobs = evaluate_jobs(new_jobs)
     except ValueError as exc:

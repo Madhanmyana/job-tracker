@@ -6,6 +6,11 @@ Centralised configuration and environment-variable loading.
 All secrets are injected exclusively via environment variables (GitHub Secrets
 in CI, or a local .env / shell export for development).  No secret is ever
 hard-coded here.
+
+Migration note (2026-06-18)
+---------------------------
+Switched AI backend from Google Gemini → Groq (llama-3.3-70b-versatile) to
+bypass free-tier 429 rate limits on the Gemini API.
 """
 
 import os
@@ -26,7 +31,7 @@ def _require_env(name: str) -> str:
     return value
 
 
-GEMINI_API_KEY: str = _require_env("GEMINI_API_KEY")
+GROQ_API_KEY: str = _require_env("GROQ_API_KEY")
 GMAIL_USER_EMAIL: str = _require_env("GMAIL_USER_EMAIL")
 GMAIL_APP_PASSWORD: str = _require_env("GMAIL_APP_PASSWORD")
 
@@ -48,23 +53,11 @@ SMTP_HOST: str = "smtp.gmail.com"
 SMTP_PORT: int = 465          # SSL
 
 # ---------------------------------------------------------------------------
-# Gemini AI
+# Groq AI
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL: str = "gemini-2.0-flash"
-
-GEMINI_SYSTEM_INSTRUCTION: str = (
-    "You are an expert IT technical recruiter. Evaluate the provided job and internship "
-    "descriptions against an entry-level 'Fresher' (0-1 years experience) Backend Engineer profile. "
-    "The target roles are: Backend Engineer, Python Developer, Python Backend Developer, and related Internships. "
-    "The core skill set includes: Python, FastAPI, REST APIs, SQL, JWT, and Authentication. "
-    "Classification Rules: "
-    "- 'Tier_A_Strong': Explicitly requires Python backend skills (FastAPI/REST) AND is clearly for a fresher, intern, or entry-level candidate (0-1 years). "
-    "- 'Tier_B_Fuzzy': General software roles requiring Python/SQL, or entry-level roles where backend is only part of the stack. Also use this for roles asking for 1-2 years of experience where a strong fresher might still have a chance. "
-    "- 'Tier_C_None': Strictly discard roles requiring 3+ years of experience, purely frontend roles, completely different stacks (e.g., exclusively Java/Spring Boot or Node.js), or non-engineering positions. "
-    "Classify roles strictly into 'Tier_A_Strong', 'Tier_B_Fuzzy', or 'Tier_C_None'. "
-    "Prioritize accurate experience-level matching over raw keyword volume."
-)
+# Model used for all AI scoring and tier classification.
+GROQ_MODEL: str = "llama-3.3-70b-versatile"
 
 # ---------------------------------------------------------------------------
 # Tier filtering thresholds

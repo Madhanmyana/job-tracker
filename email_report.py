@@ -154,7 +154,7 @@ def build_html(jobs: list[JobEvaluation]) -> str:
         color:#ffffff;
     ">
         <h1 style="margin:0; font-size:22px; font-weight:700; letter-spacing:-0.3px;">
-            ☁️ Daily Cloud Engineer Job Report
+            💼 Daily Backend Engineer Job Report
         </h1>
         <p style="margin:6px 0 0; color:#8b949e; font-size:13px;">{run_date}</p>
         <p style="margin:10px 0 0; color:#c9d1d9; font-size:14px;">
@@ -229,7 +229,7 @@ def send_report(html_body: str, job_count: int) -> bool:
         ``True`` if the email was accepted by the SMTP server; ``False`` otherwise.
     """
     run_date = datetime.now(timezone.utc).strftime("%d %b %Y")
-    subject = f"[Job Report] {job_count} Cloud Role{'s' if job_count != 1 else ''} — {run_date}"
+    subject = f"[Job Report] {job_count} Backend Role{'s' if job_count != 1 else ''} — {run_date}"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject

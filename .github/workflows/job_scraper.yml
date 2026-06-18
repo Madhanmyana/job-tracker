@@ -64,13 +64,19 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Stage the modified file FIRST — git pull --rebase refuses to run
+          # when there are unstaged changes in the working tree.
+          git add seen_jobs.json
+
+          # Check if there's actually anything to commit
+          if git diff --cached --quiet; then
+            echo "seen_jobs.json unchanged — nothing to commit."
+            exit 0
+          fi
+
           # Rebase to handle any concurrent commits (e.g. manual runs)
           git pull --rebase origin main
 
-          git add seen_jobs.json
-
-          # --allow-empty ensures the step doesn't fail on days with no
-          # new hashes (e.g. all jobs were duplicates and the file unchanged)
-          git commit --allow-empty -m "chore(dedup): update seen_jobs.json [skip ci]"
+          git commit -m "chore(dedup): update seen_jobs.json [skip ci]"
 
           git push origin main

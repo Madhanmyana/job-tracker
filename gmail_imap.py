@@ -16,6 +16,7 @@ Security contract
 - No message is ever deleted or moved.
 """
 
+import email
 from email.message import Message
 import imaplib
 import logging

@@ -1,0 +1,76 @@
+name: Daily Job Filter
+
+on:
+  schedule:
+    # Runs at 15:30 UTC = 9:00 PM IST every day
+    - cron: "30 15 * * *"
+
+  # Allow manual runs from the GitHub Actions UI for testing
+  workflow_dispatch:
+
+# Declare write access so the workflow can push seen_jobs.json back to main
+permissions:
+  contents: write
+
+jobs:
+  run-pipeline:
+    name: Run Job-Filtering Pipeline
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout with full history for clean rebasing ──────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Set up Python 3.12 ──────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 3. Cache pip dependencies ──────────────────────────────────────
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # ── 4. Install dependencies ────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Execute the pipeline ────────────────────────────────────────
+      #       Secrets are injected as environment variables only — they
+      #       are never written to disk or logged.
+      - name: Run pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python main.py
+
+      # ── 6. Persist deduplication state back to the repository ─────────
+      #       Runs ONLY if step 5 succeeded (pipeline sent the email and
+      #       updated seen_jobs.json).  If main.py exits with code 1 the
+      #       step above fails and this step is skipped entirely, so we
+      #       never commit a stale or corrupt state file.
+      - name: Commit updated seen_jobs.json
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Rebase to handle any concurrent commits (e.g. manual runs)
+          git pull --rebase origin main
+
+          git add seen_jobs.json
+
+          # --allow-empty ensures the step doesn't fail on days with no
+          # new hashes (e.g. all jobs were duplicates and the file unchanged)
+          git commit --allow-empty -m "chore(dedup): update seen_jobs.json [skip ci]"
+
+          git push origin main

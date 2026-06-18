@@ -51,7 +51,7 @@ SMTP_PORT: int = 465          # SSL
 # Gemini AI
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL: str = "gemini-1.5-flash"
+GEMINI_MODEL: str = "gemini-2.0-flash"
 
 GEMINI_SYSTEM_INSTRUCTION: str = (
     "You are an expert IT technical recruiter. Evaluate the provided job and internship "

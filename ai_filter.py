@@ -95,6 +95,14 @@ _DISCARD_KEYWORDS: frozenset[str] = frozenset([
     "hr ", "human resources", "sales", "business development",
 ])
 
+# Junk / automated-alert phrases — jobs whose title or body contains any of
+# these are LinkedIn notifications, feed digests, etc., not real postings.
+_JUNK_BLACKLIST: list[str] = [
+    "alert", "has been created", "feed", "notification", "job alert",
+    "your search", "digest", "unsubscribe", "email preference",
+    "manage alerts", "forwarded this email",
+]
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -128,7 +136,9 @@ def _build_prompt(batch: list[dict]) -> str:
         "where backend is part of the stack, OR roles asking 1-2 yrs where a strong "
         "fresher can still apply.\n"
         "  Tier_C_None   : Requires 3+ years, is purely frontend, uses an exclusively "
-        "different stack (Java/Spring Boot only, Node.js only), or is non-engineering.\n\n"
+        "different stack (Java/Spring Boot only, Node.js only), or is non-engineering. "
+        "Also classify automated notification emails (e.g. 'job alert', 'your alert has "
+        "been created', digest summaries) as Tier_C_None.\n\n"
         "STRICT OUTPUT FORMAT — respond with a raw JSON array ONLY.\n"
         "Do NOT wrap it in ```json code fences.\n"
         "Do NOT add any explanation, greeting, or text outside the JSON.\n"
@@ -137,7 +147,9 @@ def _build_prompt(batch: list[dict]) -> str:
         "  title         (string  — job title extracted from the posting)\n"
         "  company       (string  — company name)\n"
         "  tier          (string  — one of: Tier_A_Strong | Tier_B_Fuzzy | Tier_C_None)\n"
-        "  match_score   (integer — 1 to 100, alignment strength)\n"
+        "  match_score   (integer — MUST be between 1 and 100 inclusive. "
+        "NEVER output 0. If a job is completely irrelevant or is an automated "
+        "notification, assign match_score = 1, not 0.)\n"
         "  reason        (string  — one concise sentence explaining the tier/score)\n"
         "  clean_apply_url (string — application URL with tracking params stripped)\n\n"
         "JOB POSTINGS:\n"
@@ -229,18 +241,28 @@ def _parse_groq_response(raw_text: str, batch: list[dict]) -> list[JobEvaluation
     # Normalise field names: the model might use 'reason' instead of
     # 'logic_summary' and 'tier' instead of 'match_tier'.
     normalised: list[dict] = []
-    for item in parsed:
+    for idx, item in enumerate(parsed):
         if not isinstance(item, dict):
             continue
+
+        # Clamp match_score to [1, 100] — prevents Pydantic crash if the
+        # model returns 0 despite being told not to.
+        raw_score = item.get("match_score", 50)
+        try:
+            raw_score = int(raw_score)
+        except (TypeError, ValueError):
+            raw_score = 50
+        clamped_score = max(1, min(100, raw_score))
+
         normalised.append({
             "job_title":       item.get("title", item.get("job_title", "Unknown")),
             "company":         item.get("company", "Unknown"),
             "match_tier":      item.get("tier", item.get("match_tier", TIER_C)),
-            "match_score":     item.get("match_score", 50),
+            "match_score":     clamped_score,
             "logic_summary":   item.get("reason", item.get("logic_summary", "")),
             "clean_apply_url": item.get("clean_apply_url",
-                                        batch[parsed.index(item)].get("clean_url", "")
-                                        if parsed.index(item) < len(batch) else ""),
+                                        batch[idx].get("clean_url", "")
+                                        if idx < len(batch) else ""),
         })
 
     try:
@@ -258,11 +280,11 @@ def _keyword_fallback(batch: list[dict]) -> list[JobEvaluation]:
     Local rule-based classifier used when the Groq API call fails.
 
     Inspects ``title`` and ``text`` fields for known keywords and assigns
-    a conservative tier and score.  Jobs are never silently dropped — they
-    are assigned ``Tier_C_None`` only if discard keywords dominate.
+    a conservative tier and score.  Automated alert/notification emails are
+    detected via ``_JUNK_BLACKLIST`` and silently skipped.
 
     This ensures the pipeline always produces *some* output even during
-    prolonged API outages.
+    prolonged API outages, without polluting the report with junk.
     """
     logger.warning(
         "Groq API unavailable for this batch — running keyword fallback classifier "
@@ -272,27 +294,41 @@ def _keyword_fallback(batch: list[dict]) -> list[JobEvaluation]:
     results: list[JobEvaluation] = []
 
     for job in batch:
-        combined = (
-            (job.get("title", "") + " " + job.get("text", "")).lower()
-        )
+        title_lower = job.get("title", "").lower()
+        desc_lower = job.get("text", "").lower()
+        combined = title_lower + " " + desc_lower
         apply_url = job.get("clean_url") or job.get("apply_url", "")
 
-        # Check discard signals first
+        # ── Filter out junk / automated alert emails ──────────────────
+        is_junk = any(
+            junk in title_lower or junk in desc_lower
+            for junk in _JUNK_BLACKLIST
+        )
+        if is_junk:
+            logger.info(
+                "  🗑️ JUNK  Skipping automated alert/notification: %s",
+                job.get("title", "?"),
+            )
+            continue
+
+        # ── Check discard signals ─────────────────────────────────────
         if any(kw in combined for kw in _DISCARD_KEYWORDS):
             tier = TIER_C
             score = 20
             reason = "[Keyword Fallback] Discard keywords detected (3+ yrs / senior / wrong stack)."
         elif any(kw in combined for kw in _TIER_A_KEYWORDS):
+            has_keyword = True
             tier = TIER_A
             score = 72   # conservative — we don't have AI confidence here
             reason = "[Keyword Fallback] Strong Python backend / fresher keywords matched."
         elif any(kw in combined for kw in _TIER_B_KEYWORDS):
+            has_keyword = True
             tier = TIER_B
             score = 62   # deliberately below MIN_TIER_B_SCORE=70 unless clearly relevant
             reason = "[Keyword Fallback] General Python/software keywords matched."
         else:
             tier = TIER_C
-            score = 15
+            score = 1
             reason = "[Keyword Fallback] No relevant keywords found."
 
         try:

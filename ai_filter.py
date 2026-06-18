@@ -24,6 +24,7 @@ this and aborts the run with a log entry rather than sending a broken email.
 
 import json
 import logging
+import time
 from textwrap import dedent
 
 from google import genai
@@ -193,6 +194,7 @@ def evaluate_jobs(raw_jobs: list[dict]) -> list[JobEvaluation]:
 
         prompt = _build_prompt(batch)
         evaluations = _call_gemini(client, prompt)
+        time.sleep(65)  # pause between batches to stay within free-tier RPM limit
 
         logger.info(
             "Batch %d/%d: received %d evaluation(s). Applying tier filter …",

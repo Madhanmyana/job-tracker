@@ -1,4 +1,8 @@
+Built for Digital Heroes: [https://digitalheroesco.com](https://digitalheroesco.com)
+
 # 💼 Automated AI-Powered Job-Filtering Pipeline
+
+[![Built for Digital Heroes](https://img.shields.io/badge/Built%20for-Digital%20Heroes-blue?style=for-the-badge)](https://digitalheroesco.com)
 
 An automated, daily job-hunting pipeline designed for entry-level Python Backend Engineers. The pipeline ingests new jobs from two distinct streams (incoming Gmail alerts and automated web scrapers), filters out duplicate listings using canonicalized URL hashing, evaluates/scores the jobs using a state-of-the-art LLM on Groq, and sends a highly structured daily digest email with the best matches.
 

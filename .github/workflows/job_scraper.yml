@@ -2,8 +2,8 @@ name: Daily Job Filter
 
 on:
   schedule:
-    # Runs at 15:30 UTC = 9:00 PM IST every day
-    - cron: "30 15 * * *"
+    # Runs at 14:00 UTC = 8:00 PM IST every day
+    - cron: "0 14 * * *"
 
   # Allow manual runs from the GitHub Actions UI for testing
   workflow_dispatch:

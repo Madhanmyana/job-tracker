@@ -48,15 +48,9 @@ logger = logging.getLogger(__name__)
 # Direct WordPress site — no TinyURL redirects.
 BASE_URL: str = "https://freshersjobs24.com/"
 
-SCRAPE_BOARDS: list[dict] = [
-    {
-        "name": "FreshersJobs24 — IT Jobs",
-        "locations": ["hyderabad"],
-    },
-    {
-        "name": "FreshersJobs24 — Internship Jobs",
-        "locations": ["hyderabad", "remote"],
-    },
+LOCATIONS: list[str] = [
+    "hyderabad",
+    "remote",
 ]
 
 SEARCH_KEYWORDS: list[str] = [
@@ -66,9 +60,6 @@ SEARCH_KEYWORDS: list[str] = [
     "remote python developer",
     "backend developer intern",
 ]
-
-# Fallback if a board entry omits the "locations" key.
-DEFAULT_LOCATIONS: list[str] = ["hyderabad"]
 
 # Maximum pages to crawl per keyword × board combination.
 _MAX_PAGES: int = 5
@@ -265,99 +256,89 @@ def scrape_all() -> list[dict]:
       - ``text`` (str)      — used by ``ai_filter._build_prompt`` (body snippet)
       - ``source`` (str)    — used by ``ai_filter._keyword_fallback``
     """
-    if not SCRAPE_BOARDS:
-        logger.info("No scrape boards configured; Stream B skipped.")
-        return []
-
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "mobile": False}
     )
 
     all_jobs: list[dict] = []
-    total_combinations = sum(
-        len(b.get("locations", DEFAULT_LOCATIONS)) for b in SCRAPE_BOARDS
-    ) * len(SEARCH_KEYWORDS)
+    total_combinations = len(LOCATIONS) * len(SEARCH_KEYWORDS)
     combination_idx = 0
 
     for keyword in SEARCH_KEYWORDS:
-        for board in SCRAPE_BOARDS:
-            board_name: str = board.get("name", "Unknown Board")
-            locations: list[str] = board.get("locations", DEFAULT_LOCATIONS)
+        for location in LOCATIONS:
+            combination_idx += 1
 
-            for location in locations:
-                combination_idx += 1
+            logger.info(
+                "━━━ [%d/%d] Keyword: '%s' | Location: %s ━━━",
+                combination_idx, total_combinations, keyword, location,
+            )
 
-                logger.info(
-                    "━━━ [%d/%d] Keyword: '%s' | Location: %s | Board: %s ━━━",
-                    combination_idx, total_combinations, keyword, location, board_name,
+            prev_content: str = ""
+
+            for page in range(1, _MAX_PAGES + 1):
+                target_url = _build_search_url(
+                    BASE_URL, keyword, location, page,
                 )
 
-                prev_content: str = ""
+                logger.info(
+                    "  📄 Page %d/%d — %s",
+                    page, _MAX_PAGES, target_url,
+                )
 
-                for page in range(1, _MAX_PAGES + 1):
-                    target_url = _build_search_url(
-                        BASE_URL, keyword, location, page,
+                try:
+                    response = scraper.get(
+                        target_url,
+                        timeout=15,
+                        allow_redirects=True,
                     )
 
-                    logger.info(
-                        "  📄 Page %d/%d — %s",
-                        page, _MAX_PAGES, target_url,
-                    )
-
-                    try:
-                        response = scraper.get(
-                            target_url,
-                            timeout=15,
-                            allow_redirects=True,
-                        )
-
-                        # ── Safety check 1: non-200 status ────────────────
-                        if response.status_code != 200:
-                            logger.warning(
-                                "  ⚠️  Page %d returned HTTP %d; stopping pagination for this combo.",
-                                page, response.status_code,
-                            )
-                            break
-
-                        page_html: str = response.text
-
-                        # ── Safety check 3: duplicate content detection ───
-                        if page_html == prev_content:
-                            logger.info(
-                                "  🔁 Page %d content identical to previous page; stopping pagination.",
-                                page,
-                            )
-                            break
-
-                        prev_content = page_html
-
-                        # ── Extract jobs ──────────────────────────────────
-                        page_jobs = _extract_jobs_from_page(page_html, board_name)
-
-                        # ── Safety check 2: zero results ─────────────────
-                        if not page_jobs:
-                            logger.info(
-                                "  🚫 Page %d yielded 0 job elements; stopping pagination.",
-                                page,
-                            )
-                            break
-
-                        logger.info(
-                            "  ✅ Page %d: extracted %d job(s).",
-                            page, len(page_jobs),
-                        )
-                        all_jobs.extend(page_jobs)
-
-                    except Exception as exc:  # noqa: BLE001
+                    # ── Safety check 1: non-200 status ────────────────
+                    if response.status_code != 200:
                         logger.warning(
-                            "  ❌ Page %d request failed (%s: %s); stopping pagination.",
-                            page, type(exc).__name__, exc,
+                            "  ⚠️  Page %d returned HTTP %d; stopping pagination for this combo.",
+                            page, response.status_code,
                         )
                         break
 
-                    # ── Rate limiting ─────────────────────────────────────
-                    if page < _MAX_PAGES:
-                        time.sleep(_REQUEST_DELAY)
+                    page_html: str = response.text
+
+                    # ── Safety check 3: duplicate content detection ───
+                    if page_html == prev_content:
+                        logger.info(
+                            "  🔁 Page %d content identical to previous page; stopping pagination.",
+                            page,
+                        )
+                        break
+
+                    prev_content = page_html
+
+                    # ── Extract jobs ──────────────────────────────────
+                    page_jobs = _extract_jobs_from_page(page_html, "FreshersJobs24")
+
+                    # ── Safety check 2: zero results ─────────────────
+                    if not page_jobs:
+                        logger.info(
+                            "  🚫 Page %d yielded 0 job elements; stopping pagination.",
+                            page,
+                        )
+                        break
+
+                    logger.info(
+                        "  ✅ Page %d: extracted %d job(s).",
+                        page, len(page_jobs),
+                    )
+                    all_jobs.extend(page_jobs)
+
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "  ❌ Page %d request failed (%s: %s); stopping pagination.",
+                        page, type(exc).__name__, exc,
+                    )
+                    break
+
+                # ── Rate limiting ─────────────────────────────────────
+                if page < _MAX_PAGES:
+                    time.sleep(_REQUEST_DELAY)
 
     # ── Final deduplication across all boards and keywords ─────────────────
     unique_jobs = _deduplicate_jobs(all_jobs)

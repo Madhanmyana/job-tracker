@@ -76,44 +76,8 @@ MIN_TIER_B_SCORE: int = 70   # Tier_B jobs below this score are discarded
 SEEN_JOBS_FILE: str = "seen_jobs.json"
 
 # ---------------------------------------------------------------------------
-# Stream B — Scraping targets
+# Stream B — Scraping
 # ---------------------------------------------------------------------------
-# Each entry is a dict with keys:
-#   name (str)  : human-readable label used in logs
-#   url  (str)  : full URL to scrape
-#
-# Add your Internshala / custom career-site URLs here.
-# The scraping block in scraper.py is fully isolated in a try/except, so a
-# failure for one target never blocks the rest of the pipeline.
+# Board URLs, search keywords, and pagination config are now managed directly
+# in ``scraper.py`` (aggregate board scraper).  No SCRAPE_TARGETS needed here.
 # ---------------------------------------------------------------------------
-
-SCRAPE_TARGETS: list[dict] = [
-    {
-        "name": "Infosys Careers",
-        "url": "https://sjobs.brassring.com",
-    },
-    {
-        "name": "Wipro Careers",
-        "url": "https://wiproaerospace.com/careers/",
-    },
-    {
-        "name": "TCS Careers",
-        "url": "https://www.tcs.com/careers/india",
-    },
-    {
-        "name": "Deloitte Careers",
-        "url": "https://www.deloitte.com/us/en/careers/careers.html",
-    },
-    {
-        "name": "Accenture Careers",
-        "url": "https://www.accenture.com/in-en/careers",
-    },
-    {
-        "name": "Capgemini Careers",
-        "url": "https://www.capgemini.com/careers/join-capgemini/job-search/",
-    },
-    {
-        "name": "Cognizant Careers",
-        "url": "https://careers.cognizant.com/india-en/",
-    },
-]

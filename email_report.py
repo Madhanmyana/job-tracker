@@ -143,17 +143,33 @@ def build_html(
         """Render the 📺 Online Study For You Links section."""
         if not links:
             return ""
+
+        # Extract the source video URL from the first link (all share the same video)
+        video_url = links[0].get("video_url", "")
+        video_title = links[0].get("title", "OnlineStudy4u Video")
+
+        # Build the source video header
+        video_header = ""
+        if video_url:
+            video_header = f"""
+            <p style="margin:0 0 14px; font-size:14px; line-height:1.6;">
+                <strong>Source Video:</strong>&nbsp;
+                <a href="{_esc(video_url)}"
+                   style="color:#7c3aed; text-decoration:none; font-weight:600;"
+                >{_esc(video_title)}</a>
+            </p>"""
+
+        # Build the job-link bullet list
         items = "\n".join(
             f"""
             <li style="margin-bottom:10px; font-size:14px; line-height:1.6;">
                 <a href="{_esc(link.get('url', '#'))}"
                    style="color:#7c3aed; text-decoration:none; font-weight:600;"
-                >{_esc(link.get('title', 'Link'))}</a>
-                <br/>
-                <span style="color:#8b949e; font-size:12px;">{_esc(link.get('url', ''))}</span>
+                >{_esc(link.get('url', 'Link'))}</a>
             </li>"""
             for link in links
         )
+
         return f"""
         <div style="margin-bottom:32px;">
             <h2 style="
@@ -163,6 +179,7 @@ def build_html(
                 padding-bottom:6px;
                 margin-bottom:12px;
             ">📺 Online Study For You Links ({len(links)} link{"s" if len(links) != 1 else ""})</h2>
+            {video_header}
             <ul style="
                 list-style:none;
                 padding-left:0;

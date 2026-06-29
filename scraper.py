@@ -32,7 +32,9 @@ Add entries to ``SCRAPE_BOARDS`` below.  Each entry is a dict::
     }
 """
 
+import datetime
 import logging
+import re
 import time
 from urllib.parse import quote_plus
 
@@ -66,6 +68,31 @@ _MAX_PAGES: int = 5
 
 # Seconds to sleep between consecutive HTTP requests.
 _REQUEST_DELAY: float = 2.0
+
+
+# ---------------------------------------------------------------------------
+# Stale-job filter
+# ---------------------------------------------------------------------------
+
+_YEAR_RE = re.compile(r"\b20\d{2}\b")
+
+
+def is_outdated(title: str) -> bool:
+    """
+    Return ``True`` if the job title mentions only graduation / hiring years
+    that are older than last year.
+
+    For example, if the current year is 2026 then any title whose *highest*
+    mentioned year is < 2025 is treated as stale SEO-spam (e.g.
+    "Python Developer for 2022 Batch").
+
+    Titles with **no** year at all are **not** considered outdated.
+    """
+    years = [int(y) for y in _YEAR_RE.findall(title)]
+    if not years:
+        return False
+    current_year = datetime.datetime.now().year
+    return max(years) < current_year - 1
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +193,11 @@ def _extract_jobs_from_page(html: str, board_name: str) -> list[dict]:
             if not job_url or not job_url.startswith("http"):
                 continue
 
+            # ── Stale-job filter ──────────────────────────────────
+            if is_outdated(title_text):
+                logger.debug("Skipping outdated job: %s", title_text)
+                continue
+
             # Description: grab the entry content / excerpt
             desc_tag = article.find(
                 "div", class_=lambda c: c and ("entry" in c or "excerpt" in c or "content" in c)
@@ -205,6 +237,11 @@ def _extract_jobs_from_page(html: str, board_name: str) -> list[dict]:
         if href in seen_hrefs:
             continue
         if not any(kw in href.lower() or kw in text.lower() for kw in keywords):
+            continue
+
+        # ── Stale-job filter ──────────────────────────────────────
+        if is_outdated(text):
+            logger.debug("Skipping outdated job: %s", text)
             continue
 
         seen_hrefs.add(href)

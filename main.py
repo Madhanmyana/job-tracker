@@ -8,19 +8,22 @@ Execution order
 1.  Load config & seen hash-set from ``seen_jobs.json``
 2.  Stream A  — Gmail IMAP: fetch unread jobs from ``Daily-Jobs`` only
 3.  Stream B  — Scraping:   fetch jobs from configured targets (isolated try/except)
-4.  Merge both streams and deduplicate against the seen set
-5.  Abort gracefully if there are no new jobs
-6.  AI filter — Groq (llama-3.3-70b-versatile): score and tier-classify new jobs
-7.  Abort gracefully if no jobs pass the tier threshold
-8.  Build HTML report and send via SMTP (self → self)
-9.  ONLY on SMTP success:
+4.  Stream C  — YouTube RSS: extract job links from OnlineStudy4u (isolated)
+5.  Merge all streams and deduplicate against the seen set
+6.  Abort gracefully if there are no new jobs
+7.  AI filter — Groq (llama-3.3-70b-versatile): score and tier-classify
+    non-YouTube jobs.  YouTube links bypass AI and go directly to email.
+8.  Abort gracefully if no jobs pass the tier threshold AND there are no
+    YouTube links
+9.  Build HTML report and send via SMTP (self → self)
+10. ONLY on SMTP success:
       a. Mark Gmail alert emails as READ (via IMAP)
       b. Append new hashes to seen set and overwrite ``seen_jobs.json``
 
 Transactional guarantee
 -----------------------
-Steps 9a and 9b execute **only** after step 8 returns ``True``.  If the SMTP
-send fails at any point:
+Steps 10a and 10b execute **only** after step 9 returns ``True``.  If the
+SMTP send fails at any point:
   - No Gmail messages are marked as read
   - ``seen_jobs.json`` is not updated
   - The next run will re-process the same emails and retry
@@ -49,6 +52,7 @@ from gmail_imap import fetch_unread_jobs, mark_as_read  # noqa: E402
 from scraper import scrape_all                          # noqa: E402
 from ai_filter import evaluate_jobs                     # noqa: E402
 from email_report import build_html, send_report        # noqa: E402
+from youtube_stream import scrape_youtube_links          # noqa: E402
 
 
 def main() -> None:
@@ -81,14 +85,28 @@ def main() -> None:
         # Stream B failure is non-fatal; pipeline continues with Gmail jobs.
         logger.warning("Stream B raised an unhandled exception: %s. Continuing.", exc)
 
-    # ── Step 4: Merge & deduplicate ───────────────────────────────────────
-    all_raw: list[dict] = gmail_jobs + scraped_jobs
+    # ── Step 4: Stream C — YouTube RSS (isolated) ────────────────────────
+    logger.info("--- Stream C: YouTube RSS (OnlineStudy4u) ---")
+    youtube_jobs_raw: list[dict] = []
+    try:
+        youtube_jobs_raw = scrape_youtube_links()
+    except Exception as exc:   # noqa: BLE001
+        # Stream C failure is non-fatal; pipeline continues without YT links.
+        logger.warning("Stream C raised an unhandled exception: %s. Continuing.", exc)
+
+    # ── Step 5: Merge & deduplicate ───────────────────────────────────────
+    all_raw: list[dict] = gmail_jobs + scraped_jobs + youtube_jobs_raw
     logger.info(
-        "Combined: %d job(s) from Gmail + %d from scraping = %d total.",
-        len(gmail_jobs), len(scraped_jobs), len(all_raw),
+        "Combined: %d Gmail + %d scraped + %d YouTube = %d total.",
+        len(gmail_jobs), len(scraped_jobs), len(youtube_jobs_raw), len(all_raw),
     )
 
     new_jobs, new_hashes = filter_new(all_raw, seen)
+
+    # Separate YouTube links from jobs that need AI evaluation.
+    # YouTube links bypass the Groq LLM entirely.
+    youtube_links: list[dict] = [j for j in new_jobs if j.get("source") == "youtube"]
+    ai_candidate_jobs: list[dict] = [j for j in new_jobs if j.get("source") != "youtube"]
 
     if not new_jobs:
         logger.info("No new jobs after deduplication. Pipeline complete — nothing to send.")
@@ -99,22 +117,30 @@ def main() -> None:
             mark_as_read(email_uids)
         return
 
-    logger.info("%d new job(s) will be evaluated by AI.", len(new_jobs))
+    logger.info(
+        "%d new item(s): %d for AI evaluation, %d YouTube link(s) (bypass AI).",
+        len(new_jobs), len(ai_candidate_jobs), len(youtube_links),
+    )
 
-    # ── Step 5 (implicit) — no new jobs was handled above ─────────────────
+    # ── Step 6 (implicit) — no new jobs was handled above ─────────────────
 
-    # ── Step 6: AI tier filtering ─────────────────────────────────────────
-    logger.info("--- AI Evaluation (Groq — llama-3.3-70b-versatile) ---")
-    try:
-        filtered_jobs = evaluate_jobs(new_jobs)
-    except ValueError as exc:
-        logger.error("AI evaluation failed: %s", exc)
-        logger.error("Pipeline aborted. No emails sent; state unchanged.")
-        sys.exit(1)
+    # ── Step 7: AI tier filtering (non-YouTube jobs only) ─────────────────
+    filtered_jobs = []
+    if ai_candidate_jobs:
+        logger.info("--- AI Evaluation (Groq — llama-3.3-70b-versatile) ---")
+        try:
+            filtered_jobs = evaluate_jobs(ai_candidate_jobs)
+        except ValueError as exc:
+            logger.error("AI evaluation failed: %s", exc)
+            # If we still have YouTube links, continue with those alone.
+            if not youtube_links:
+                logger.error("Pipeline aborted. No emails sent; state unchanged.")
+                sys.exit(1)
+            logger.warning("Continuing with %d YouTube link(s) only.", len(youtube_links))
 
-    if not filtered_jobs:
+    if not filtered_jobs and not youtube_links:
         logger.info(
-            "No jobs passed the tier filter today. "
+            "No jobs passed the tier filter and no YouTube links today. "
             "Marking emails as read and updating seen set."
         )
         # Even though no jobs are worth reporting, update state to avoid
@@ -124,26 +150,30 @@ def main() -> None:
         save_seen(seen)
         return
 
-    logger.info(
-        "%d job(s) passed: %d Tier A, %d Tier B.",
-        len(filtered_jobs),
-        sum(1 for j in filtered_jobs if j.match_tier == TIER_A),
-        sum(1 for j in filtered_jobs if j.match_tier == TIER_B),
-    )
+    if filtered_jobs:
+        logger.info(
+            "%d job(s) passed AI filter: %d Tier A, %d Tier B.",
+            len(filtered_jobs),
+            sum(1 for j in filtered_jobs if j.match_tier == TIER_A),
+            sum(1 for j in filtered_jobs if j.match_tier == TIER_B),
+        )
+    if youtube_links:
+        logger.info("%d YouTube link(s) will be included directly.", len(youtube_links))
 
-    # ── Step 7: Build and send the HTML report ────────────────────────────
+    # ── Step 8: Build and send the HTML report ────────────────────────────
     logger.info("--- Email Delivery (SMTP) ---")
-    html_body = build_html(filtered_jobs)
-    smtp_success: bool = send_report(html_body, job_count=len(filtered_jobs))
+    total_items = len(filtered_jobs) + len(youtube_links)
+    html_body = build_html(filtered_jobs, youtube_links=youtube_links)
+    smtp_success: bool = send_report(html_body, job_count=total_items)
 
-    # ── Step 8 / 9: Transactional commit ─────────────────────────────────
+    # ── Step 9 / 10: Transactional commit ────────────────────────────────
     if smtp_success:
         logger.info("--- Transactional Commit ---")
 
-        # 9a. Mark Gmail alert emails as read (IMAP)
+        # 10a. Mark Gmail alert emails as read (IMAP)
         mark_as_read(email_uids)
 
-        # 9b. Persist new hashes to seen_jobs.json
+        # 10b. Persist new hashes to seen_jobs.json
         seen.update(new_hashes)
         save_seen(seen)
 

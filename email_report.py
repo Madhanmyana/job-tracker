@@ -50,9 +50,20 @@ _TIER_META: dict[str, dict] = {
 # HTML builder
 # ---------------------------------------------------------------------------
 
-def build_html(jobs: list[JobEvaluation]) -> str:
+def build_html(
+    jobs: list[JobEvaluation],
+    youtube_links: list[dict] | None = None,
+) -> str:
     """
     Render *jobs* as a styled HTML email body grouped by tier.
+
+    Parameters
+    ----------
+    jobs : list[JobEvaluation]
+        AI-evaluated jobs to display in tier sections.
+    youtube_links : list[dict] | None
+        Optional YouTube-sourced link dicts (bypass AI).  Each dict must
+        have ``"title"`` and ``"url"`` keys.
 
     Returns
     -------
@@ -128,6 +139,42 @@ def build_html(jobs: list[JobEvaluation]) -> str:
         </div>
         """
 
+    def youtube_section(links: list[dict]) -> str:
+        """Render the 📺 Online Study For You Links section."""
+        if not links:
+            return ""
+        items = "\n".join(
+            f"""
+            <li style="margin-bottom:10px; font-size:14px; line-height:1.6;">
+                <a href="{_esc(link.get('url', '#'))}"
+                   style="color:#7c3aed; text-decoration:none; font-weight:600;"
+                >{_esc(link.get('title', 'Link'))}</a>
+                <br/>
+                <span style="color:#8b949e; font-size:12px;">{_esc(link.get('url', ''))}</span>
+            </li>"""
+            for link in links
+        )
+        return f"""
+        <div style="margin-bottom:32px;">
+            <h2 style="
+                font-size:18px;
+                color:#7c3aed;
+                border-bottom:2px solid #7c3aed;
+                padding-bottom:6px;
+                margin-bottom:12px;
+            ">📺 Online Study For You Links ({len(links)} link{"s" if len(links) != 1 else ""})</h2>
+            <ul style="
+                list-style:none;
+                padding-left:0;
+                margin:0;
+            ">
+                {items}
+            </ul>
+        </div>
+        """
+
+    yt_links = youtube_links or []
+
     body = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -159,7 +206,7 @@ def build_html(jobs: list[JobEvaluation]) -> str:
         <p style="margin:6px 0 0; color:#8b949e; font-size:13px;">{run_date}</p>
         <p style="margin:10px 0 0; color:#c9d1d9; font-size:14px;">
             {len(jobs)} role{"s" if len(jobs) != 1 else ""} passed the tier filter today
-            ({len(tier_a_jobs)} Tier A · {len(tier_b_jobs)} Tier B)
+            ({len(tier_a_jobs)} Tier A · {len(tier_b_jobs)} Tier B){f" · {len(yt_links)} YouTube link{'s' if len(yt_links) != 1 else ''}" if yt_links else ""}
         </p>
     </div>
 
@@ -167,6 +214,7 @@ def build_html(jobs: list[JobEvaluation]) -> str:
     <div style="padding:24px 32px;">
         {section(tier_a_jobs, TIER_A)}
         {section(tier_b_jobs, TIER_B)}
+        {youtube_section(yt_links)}
     </div>
 
     <!-- Footer -->

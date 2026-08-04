@@ -1,4 +1,3 @@
-Built for Digital Heroes: [https://digitalheroesco.com](https://digitalheroesco.com)
 
 # 💼 Automated AI-Powered Job-Filtering Pipeline
 

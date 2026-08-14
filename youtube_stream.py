@@ -44,7 +44,9 @@ _NS: dict[str, str] = {
 # URL extraction & strict blacklist filtering
 # ---------------------------------------------------------------------------
 
-_URL_RE = re.compile(r"(https?://[^\s]+)")
+# Improved regex: match http(s) URLs, excluding trailing punctuation/whitespace
+# This handles URLs with query parameters, fragments, and special characters
+_URL_RE = re.compile(r"(https?://[^\s<>\"'{}|\\^`\[\]]*[^\s<>\"'{}|\\^`\[\].,;:!?\)])")
 
 # Social-media / messaging domains to always drop.
 _BLACKLISTED_DOMAINS: tuple[str, ...] = (
@@ -70,11 +72,22 @@ def _extract_job_urls(text: str) -> list[str]:
     """
     Extract all URLs from *text*, drop anything matching the social-media
     blacklist, and return the remaining links.
+    
+    The regex pattern matches http(s) URLs while intelligently excluding
+    trailing punctuation (commas, periods, parentheses, etc.) that are
+    commonly found after URLs in natural text.
     """
     if not text:
         return []
     raw_urls = _URL_RE.findall(text)
-    return [u for u in raw_urls if not _is_blacklisted(u)]
+    # Remove duplicates while preserving order
+    seen: set[str] = set()
+    filtered: list[str] = []
+    for u in raw_urls:
+        if not _is_blacklisted(u) and u not in seen:
+            seen.add(u)
+            filtered.append(u)
+    return filtered
 
 
 # ---------------------------------------------------------------------------
